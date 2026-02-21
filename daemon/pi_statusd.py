@@ -286,30 +286,42 @@ class Scanner:
                 focused = self._focus_terminal_app(focused_app, focus_hints, focused_app_pid)
 
         # 3) Ghostty global hint fallback (split panes can break PID ancestry).
-        if not focused and focus_hints:
+        # Skip for Ghostty - we'll use CGWindowList in step 6 instead, which can switch tabs.
+        if not focused and focus_hints and focused_app != "Ghostty":
             focused = self._focus_ghostty_window_by_hints_any(focus_hints)
             if focused:
                 focused_app = "Ghostty"
 
-        # 4) TTY-based focus for iTerm2/Terminal
-        if not focused and tty and tty != "??":
+        # 4) TTY-based focus for iTerm2/Terminal (skip if we know it's Ghostty)
+        if not focused and tty and tty != "??" and focused_app != "Ghostty":
             focused = self._focus_terminal_by_tty(tty)
 
-        # 5) title-hint focus (iTerm2/Terminal)
-        if not focused and mux_session:
+        # 5) title-hint focus (iTerm2/Terminal) (skip if we know it's Ghostty)
+        if not focused and mux_session and focused_app != "Ghostty":
             focused = self._focus_terminal_by_title_hint(mux_session)
             if not focused and mux_session.startswith("agent-"):
                 focused = self._focus_terminal_by_title_hint(mux_session[len("agent-"):])
 
-        # 6) Ghostty fallback without launching new windows:
-        # bring existing Ghostty process frontmost when client exists but window matching failed.
-        if not focused and client_pid and focused_app == "Ghostty":
-            focused = self._activate_existing_app("Ghostty")
+        # 6) Ghostty CGWindowList-based tab switching:
+        # System Events often can't see Ghostty windows, but CGWindowList can.
+        # Use it to find the tab by title and switch to it with Cmd+N keystrokes.
+        if not focused and (focused_app == "Ghostty" or (mux and client_pid)):
+            search_hints = focus_hints[:]
+            if mux:
+                search_hints.append(mux)
+            print(f"[step6] hints={search_hints}", flush=True)
+            focused, reason = self._focus_ghostty_via_cgwindow(search_hints, cwd)
+            print(f"[step6] focused={focused}, reason={reason}", flush=True)
+            if focused:
+                focused_app = "Ghostty"
 
         # 7) if no corresponding client is running, open a new shell and attach/open there
+        # But NOT if we know Ghostty is the terminal - it's already running, we just couldn't focus the tab
         opened_attach = False
         opened_shell = False
-        if not focused and not client_pid:
+        print(f"[step7] check: focused={focused}, client_pid={client_pid}, focused_app={focused_app}", flush=True)
+        if not focused and not client_pid and focused_app != "Ghostty":
+            print(f"[step7] OPENING SHELL", flush=True)
             if mux == "zellij" and mux_session:
                 opened_attach = self._open_terminal_with_shell(command=f"zellij attach {self._sh_quote(mux_session)}", cwd=cwd)
             elif cwd:
@@ -468,6 +480,15 @@ class Scanner:
                 if mux == "screen" and "screen" in args:
                     return r["pid"]
 
+        # For tmux: find ANY tmux client (not server) since there's usually just one.
+        # tmux server runs on tty "??" while clients have real ttys.
+        if mux == "tmux":
+            for r in rows:
+                args = (r.get("args") or "")
+                r_tty = r.get("tty", "??")
+                if "tmux" in args and r_tty != "??" and r_tty != tty:
+                    return r["pid"]
+
         return None
 
     def _detect_terminal_target_for_pid(self, pid: int, by_pid: Dict[int, Dict]) -> tuple[str | None, int | None]:
@@ -523,12 +544,9 @@ class Scanner:
 
     def _focus_terminal_app(self, app_name: str, hints: List[str], app_pid: int | None = None) -> bool:
         if app_name == "Ghostty":
-            if not hints or not app_pid:
-                return False
-            # Try to raise the exact Ghostty window (strict matching to avoid wrong desktop jumps).
-            if self._focus_ghostty_window_by_title_hints(hints, app_pid):
-                return True
-            # Avoid claiming success for Ghostty when we could not target the specific session window.
+            # For Ghostty, always return False here to fall through to CGWindowList-based
+            # tab switching (step 6). The AppleScript approach can raise the window but
+            # can't switch tabs, so it gives false positives.
             return False
 
         return self._activate_app(app_name)
@@ -610,6 +628,120 @@ end try
 return "no"
 '''
         return self._run_osascript(script) == "ok"
+
+    def _get_ghostty_tabs_via_cgwindow(self) -> List[Dict]:
+        """Get Ghostty tabs via CGWindowList API (works even when System Events can't see them)."""
+        try:
+            import Quartz
+        except ImportError:
+            return []
+
+        options = Quartz.kCGWindowListOptionAll
+        window_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
+
+        ghostty_tabs = []
+        for win in window_list:
+            owner = win.get(Quartz.kCGWindowOwnerName, "")
+            if "ghostty" in owner.lower():
+                layer = win.get(Quartz.kCGWindowLayer, 0)
+                alpha = win.get(Quartz.kCGWindowAlpha, 1.0)
+                name = win.get(Quartz.kCGWindowName, "")
+                bounds = win.get(Quartz.kCGWindowBounds, {})
+                # Main content windows (layer 0, full alpha, has height > tabbar, has name)
+                if layer == 0 and alpha >= 1.0 and bounds.get("Height", 0) > 100 and name:
+                    ghostty_tabs.append({
+                        "name": name,
+                        "number": win.get(Quartz.kCGWindowNumber, 0),
+                        "pid": win.get(Quartz.kCGWindowOwnerPID, 0),
+                        "bounds": bounds,
+                        "isOnScreen": win.get(Quartz.kCGWindowIsOnscreen, False),
+                    })
+
+        # Sort by window number (roughly creation order = tab order)
+        ghostty_tabs.sort(key=lambda w: w["number"])
+        return ghostty_tabs
+
+    def _focus_ghostty_via_cgwindow(self, hints: List[str], cwd: str | None = None) -> tuple[bool, str | None]:
+        """Focus Ghostty tab using CGWindowList to find the correct tab, then keystroke."""
+        tabs = self._get_ghostty_tabs_via_cgwindow()
+        if not tabs:
+            return False, "no tabs found via CGWindowList"
+
+        # Build search terms from hints and cwd
+        search_terms = [h.lower() for h in hints if h]
+        if cwd:
+            search_terms.append(Path(cwd).name.lower())
+
+        # Find matching tab by hints
+        matched_name = None
+        for tab in tabs:
+            tab_name = tab.get("name", "").lower()
+            for term in search_terms:
+                if term in tab_name:
+                    matched_name = tab.get("name")
+                    break
+            if matched_name:
+                break
+
+        if not matched_name:
+            tab_names = [t.get("name", "") for t in tabs]
+            return False, f"no tab matched search_terms={search_terms}, available={tab_names}"
+
+        # Activate Ghostty - briefly unfocus then refocus to ensure it receives keystrokes
+        activate_script = '''
+tell application "System Events"
+    -- Briefly activate Finder to reset focus state
+    set frontmost of process "Finder" to true
+    delay 0.1
+end tell
+tell application "Ghostty" to activate
+delay 0.3
+tell application "System Events"
+    repeat 15 times
+        if frontmost of process "Ghostty" then
+            delay 0.1
+            return "ok"
+        end if
+        delay 0.1
+    end repeat
+end tell
+return "timeout"
+'''
+        activate_result = self._run_osascript(activate_script)
+        if activate_result != "ok":
+            return False, f"failed to activate Ghostty: {activate_result}"
+        
+        # Key codes for 1-9 on US keyboard
+        key_codes = {"1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25}
+        
+        # Try each tab position (1-9) and check if it's the right one
+        for key in "123456789":
+            # Send key code to Ghostty - more reliable than keystroke
+            code = key_codes[key]
+            script = f'''
+tell application "System Events"
+    tell process "Ghostty"
+        key code {code} using command down
+    end tell
+end tell
+'''
+            self._run_osascript(script)
+            time.sleep(0.15)
+            
+            # Check if current front tab matches by looking at isOnScreen=True
+            current_tabs = self._get_ghostty_tabs_via_cgwindow()
+            on_screen_tab = None
+            for t in current_tabs:
+                if t.get("isOnScreen"):
+                    on_screen_tab = t.get("name", "")
+                    current_name = on_screen_tab.lower()
+                    if matched_name.lower() in current_name or current_name in matched_name.lower():
+                        return True, f"found tab '{t.get('name')}' at Cmd+{key}"
+                    break
+            print(f"[tab-search] Cmd+{key}: on_screen='{on_screen_tab}', looking_for='{matched_name}'", flush=True)
+
+        # If we exhausted all positions, just leave Ghostty active
+        return True, f"activated Ghostty, could not find exact tab '{matched_name}'"
 
     def _activate_existing_app(self, app_name: str) -> bool:
         app = self._applescript_escape(app_name)
@@ -714,19 +846,21 @@ return "no"
         terminal_script = f'''
 set targetTTY to "{t}"
 try
-  tell application "Terminal"
-    repeat with w in windows
-      repeat with tb in tabs of w
-        try
-          if (tty of tb as text) ends with targetTTY then
-            set selected of tb to true
-            activate
-            return "ok"
-          end if
-        end try
+  if application "Terminal" is running then
+    tell application "Terminal"
+      repeat with w in windows
+        repeat with tb in tabs of w
+          try
+            if (tty of tb as text) ends with targetTTY then
+              set selected of tb to true
+              activate
+              return "ok"
+            end if
+          end try
+        end repeat
       end repeat
-    end repeat
-  end tell
+    end tell
+  end if
 end try
 return "no"
 '''
@@ -752,19 +886,21 @@ try
   end tell
 end try
 try
-  tell application "Terminal"
-    repeat with w in windows
-      repeat with tb in tabs of w
-        try
-          if (custom title of tb as text) contains needle then
-            set selected of tb to true
-            activate
-            return "ok"
-          end if
-        end try
+  if application "Terminal" is running then
+    tell application "Terminal"
+      repeat with w in windows
+        repeat with tb in tabs of w
+          try
+            if (custom title of tb as text) contains needle then
+              set selected of tb to true
+              activate
+              return "ok"
+            end if
+          end try
+        end repeat
       end repeat
-    end repeat
-  end tell
+    end tell
+  end if
 end try
 return "no"
 '''
@@ -874,8 +1010,17 @@ return "no"
 '''
         return self._run_osascript(script) == "ok"
 
-    def _run_osascript(self, script: str) -> str:
-        proc = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True)
+    def _run_osascript(self, script: str, timeout: float = 5.0) -> str:
+        try:
+            proc = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[statusd] osascript timeout after {timeout}s", flush=True)
+            return "timeout"
         if proc.returncode != 0:
             err = (proc.stderr or "").strip()
             if err:
